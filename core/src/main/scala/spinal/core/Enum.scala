@@ -68,6 +68,16 @@ class SpinalEnumElement[T <: SpinalEnum](val spinalEnum: T, val position: Int) e
     if(id < 0) return null
     spinalEnum.elements(id)
   }
+  def nextWrap: SpinalEnumElement[T] = {
+    val id = position + 1
+    if (id >= spinalEnum.elements.size) return spinalEnum.elements(0)
+    spinalEnum.elements(id)
+  }
+  def prevWrap: SpinalEnumElement[T] = {
+    val id = position - 1
+    if (id < 0) return spinalEnum.elements(spinalEnum.elements.size - 1)
+    spinalEnum.elements(id)
+  }
 }
 
 
