@@ -5,8 +5,7 @@ object SimVerilator{
 }
 
 class SimVerilator(backend : VerilatorBackend, 
-                   handle : Long,
-                   doEnd: Boolean = true) extends SimRaw(){
+                   handle : Long) extends SimRaw(){
   
   override def getIntMem(signal : Signal,
                       index : Long) : Int = {
@@ -106,7 +105,10 @@ class SimVerilator(backend : VerilatorBackend,
   override def eval() : Boolean = backend.nativeInstance.eval(handle)
   override def getTimePrecision(): Int = backend.nativeInstance.get_time_precision(handle)
   override def sleep(cycles : Long) = backend.nativeInstance.sleep(handle, cycles)
-  override def end() = if(doEnd) backend.nativeInstance.synchronized(backend.nativeInstance.deleteHandle(handle))
+  override def end() = {
+    backend.nativeInstance.synchronized(backend.nativeInstance.close(handle))
+    backend.nativeInstance.synchronized(backend.nativeInstance.deleteHandle(handle))
+  }
   override def isBufferedWrite : Boolean = false
   override def enableWave(): Unit = backend.nativeInstance.enableWave(handle)
   override def disableWave(): Unit =  backend.nativeInstance.disableWave(handle)
