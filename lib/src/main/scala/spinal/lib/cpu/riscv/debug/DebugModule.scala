@@ -8,12 +8,12 @@ case class DebugModuleCpuConfig(xlen : Int,
                                 flen : Int,
                                 withFpuRegAccess : Boolean)
 
-case class DebugModuleParameter(version : Int,
-                                harts : Int,
-                                progBufSize : Int,
-                                datacount : Int,
-                                hartsConfig : Seq[DebugModuleCpuConfig],
-                                withSysBus: Boolean = false)
+case class DebugModuleParameter(var version : Int,
+                                var harts : Int,
+                                var progBufSize : Int,
+                                var datacount : Int,
+                                var hartsConfig : Seq[DebugModuleCpuConfig],
+                                var withSysBus: Boolean = false)
 
 
 object DebugDmToHartOp extends SpinalEnum{
@@ -56,14 +56,14 @@ object DebugModuleCmdErr extends SpinalEnum(binarySequential){
 }
 
 case class DebugSysBusCmd() extends Bundle{
-  val wr = Bool
+  val wr = Bool()
   val address = UInt(32 bits)
   val data = Bits(32 bit)
   val size = UInt(2 bit)
 }
 
 case class DebugSysBusRsp() extends Bundle{
-  val error = Bool
+  val error = Bool()
   val data = Bits(32 bit)
 }
 
@@ -111,6 +111,7 @@ case class DebugModule(p : DebugModuleParameter) extends Component{
       val hartSelLo = factory.createReadAndWrite(UInt(10 bits), 0x10, 16) init(0)
       val hartSelHi = factory.createReadAndWrite(UInt(10 bits), 0x10, 6) init(0)
       val hartSel = hartSelHi @@ hartSelLo
+      val hartSelExists = hartSel < p.harts
       val haltSet = factory.setOnSet(False, 0x10, 31)
       val haltClear = factory.setOnClear(False, 0x10, 31)
       val resumeReq = factory.setOnSet(False, 0x10, 30) clearWhen(haltSet)
@@ -146,7 +147,8 @@ case class DebugModule(p : DebugModuleParameter) extends Component{
       def unavailable = bus.unavailable
       def haveReset = bus.haveReset
       bus.dmToHart << toHarts.throwWhen(toHarts.op =/= DebugDmToHartOp.DATA && !sel)
-      bus.ackReset := RegNext(sel && dmcontrol.ackhavereset)
+      // Like haltreq/resumereq, ackhavereset applies to the hartsel value written in the same access.
+      bus.ackReset := RegNext(dmcontrol.hartSelNew === hartId && dmcontrol.ackhavereset)
     }
 
     val selected = new Area{
@@ -178,17 +180,20 @@ case class DebugModule(p : DebugModuleParameter) extends Component{
       val authenticated = factory.read(True, 0x11, 7)
 
       val anyHalted  = factory.read(harts.map(h =>  h.sel && h.halted     ).orR , 0x11, 8)
-      val allHalted  = factory.read(harts.map(h => !h.sel || h.halted     ).andR, 0x11, 9)
+      // Without hasel exactly one hart is selected, so the all* flags must be 0 when it doesn't exist:
+      // a nonexistent hart is in the nonexistent state only, not also halted/running/unavailable.
+      def allOf(f : Bool) = dmcontrol.hartSelExists && f
+      val allHalted  = factory.read(allOf(harts.map(h => !h.sel || h.halted     ).andR), 0x11, 9)
       val anyRunning = factory.read(harts.map(h =>  h.sel && h.running    ).orR , 0x11, 10)
-      val allRunning = factory.read(harts.map(h => !h.sel || h.running    ).andR, 0x11, 11)
+      val allRunning = factory.read(allOf(harts.map(h => !h.sel || h.running    ).andR), 0x11, 11)
       val anyUnavail = factory.read(harts.map(h =>  h.sel && h.unavailable).orR , 0x11, 12)
-      val allUnavail = factory.read(harts.map(h => !h.sel || h.unavailable).andR, 0x11, 13)
+      val allUnavail = factory.read(allOf(harts.map(h => !h.sel || h.unavailable).andR), 0x11, 13)
       val anyNonExistent = factory.read(dmcontrol.hartSel >= p.harts, 0x11, 14)
       val allNonExistent = factory.read(anyNonExistent, 0x11, 15)
       val anyResumeAck = factory.read(harts.map(h =>  h.sel && h.resumeReady).orR, 0x11, 16)
-      val allResumeAck = factory.read(harts.map(h => !h.sel || h.resumeReady).andR, 0x11, 17)
+      val allResumeAck = factory.read(allOf(harts.map(h => !h.sel || h.resumeReady).andR), 0x11, 17)
       val anyHaveReset = factory.read(harts.map(h =>  h.sel && h.haveReset).orR, 0x11, 18)
-      val allHaveReset = factory.read(harts.map(h => !h.sel || h.haveReset).andR, 0x11, 19)
+      val allHaveReset = factory.read(allOf(harts.map(h => !h.sel || h.haveReset).andR), 0x11, 19)
 
 //      val hasresethaltreq = factory.read(True, 0x11, 5)
       val impebreak = factory.read(True, 0x11, 22)
@@ -241,20 +246,23 @@ case class DebugModule(p : DebugModuleParameter) extends Component{
         io.sysBus.cmd.payload.wr := sysBusWrite
         io.sysBus.cmd.payload.address := sbaddress0
         io.sysBus.cmd.payload.data := sbdata0
-        io.sysBus.cmd.payload.size := 3
+        io.sysBus.cmd.payload.size := 3 //If you add capabilities here, please, update the debug module fiber makeSysbusTilelink
 
         when(sysBusBusy && io.sysBus.cmd.fire) {
           sysBusCmdValid := False
-          when(sysBusWrite) {
-            sysBusBusy := False
-          }
         }
 
-        // bus response
-        when(io.sysBus.rsp.fire) {
-          sbdata0 := io.sysBus.rsp.data
+        // bus response, it completes writes as well as reads
+        when(sysBusBusy && io.sysBus.rsp.fire) {
           when(io.sysBus.rsp.error) {
             sbcs.sberror := 7
+          } otherwise {
+            when(!sysBusWrite) {
+              sbdata0 := io.sysBus.rsp.data
+            }
+            when(sbcs.sbautoincrement) {
+              sbaddress0 := sbaddress0 + 4
+            }
           }
           sysBusBusy := False
         }
@@ -263,12 +271,14 @@ case class DebugModule(p : DebugModuleParameter) extends Component{
         factory.onWrite(0x39) {
           when(sbcs.sbbusy) {
             sbcs.sbbusyerror := True
-          } elsewhen(sysBusReady) {
+          } otherwise {
             sbaddress0 := io.ctrl.cmd.payload.data.asUInt
-            when(sbcs.sbreadonaddr) {
+            when(sysBusReady && sbcs.sbreadonaddr) {
               when(sbcs.sbaccess =/= 2) {
                 // 32 bit accesses only
                 sbcs.sberror := 4
+              } elsewhen(io.ctrl.cmd.payload.data(1 downto 0) =/= 0) {
+                sbcs.sberror := 3
               } otherwise {
                 sysBusBusy := True
                 sysBusWrite := False
@@ -286,6 +296,8 @@ case class DebugModule(p : DebugModuleParameter) extends Component{
             when(sbcs.sbaccess =/= 2) {
               // 32 bit accesses only
               sbcs.sberror := 4
+            } elsewhen(sbaddress0(1 downto 0) =/= 0) {
+              sbcs.sberror := 3
             } otherwise {
               sbdata0 := io.ctrl.cmd.payload.data
               sysBusBusy := True
@@ -297,29 +309,51 @@ case class DebugModule(p : DebugModuleParameter) extends Component{
 
         // sbdata0 read
         factory.onRead(0x3c) {
-          when(sysBusReady && sbcs.sbreadondata) {
+          when(sbcs.sbbusy) {
+            sbcs.sbbusyerror := True
+          } elsewhen(sysBusReady && sbcs.sbreadondata) {
             when(sbcs.sbaccess =/= 2) {
               // 32 bit accesses only
               sbcs.sberror := 4
+            } elsewhen(sbaddress0(1 downto 0) =/= 0) {
+              sbcs.sberror := 3
             } otherwise {
               sysBusBusy := True
               sysBusWrite := False
               sysBusCmdValid := True
-              when(sbcs.sbautoincrement) {
-                sbaddress0 := sbaddress0 + 4
-              }
             }
           }
         }
       }
     }
 
+    val abstractcs = new Area{
+      val dataCount = factory.read(U(p.datacount, 4 bits), 0x16, 0)
+      val cmdErr = factory.createReadOnly(DebugModuleCmdErr(), 0x16, 8) init(DebugModuleCmdErr.NONE)
+      val busy = factory.createReadOnly(Bool(), 0x16, 12) init(False)
+      val progBufSize = factory.read(U(p.progBufSize, 5 bits), 0x16, 24)
+
+      val noError = cmdErr === DebugModuleCmdErr.NONE
+      // Only an idle abstractcs write may clear the sticky error.
+      factory.onWrite(0x16) {
+        when(!busy) {
+          cmdErr.assignFromBits(cmdErr.asBits & ~io.ctrl.cmd.data(10 downto 8))
+        }
+      }
+      val error = DebugModuleCmdErr()
+      error := DebugModuleCmdErr.NONE
+    }
+
     val progbufX = new Area{
-      val trigged = io.ctrl.cmd.valid && io.ctrl.cmd.write && (io.ctrl.cmd.address & 0x70) === 0x20
+      val trigged = io.ctrl.cmd.valid && io.ctrl.cmd.address >= 0x20 && io.ctrl.cmd.address < 0x20 + p.progBufSize
       val mem = Mem.fill(p.progBufSize)(Bits(32 bits))
       when(trigged){
         factory.cmdToRsp.error := False
-        mem.write(io.ctrl.cmd.address.resized, io.ctrl.cmd.data)
+        // Reads are supported as zero, but still count as accesses for busy/autoexec.
+        factory.cmdToRsp.data := 0
+        when(io.ctrl.cmd.write && !abstractcs.busy) {
+          mem.write(io.ctrl.cmd.address.resized, io.ctrl.cmd.data)
+        }
       }
     }
 
@@ -336,7 +370,7 @@ case class DebugModule(p : DebugModuleParameter) extends Component{
       when(io.ctrl.cmd.valid && io.ctrl.cmd.address >= 0x04 &&  io.ctrl.cmd.address < 0x04 + p.datacount){
         trigged := True
 
-        toHarts.valid   setWhen(io.ctrl.cmd.write)
+        toHarts.valid   setWhen(io.ctrl.cmd.write && !abstractcs.busy)
         toHarts.op      := DebugDmToHartOp.DATA
         toHarts.address := cmdAddress.resized
         toHarts.data    := io.ctrl.cmd.data
@@ -346,19 +380,16 @@ case class DebugModule(p : DebugModuleParameter) extends Component{
       }
     }
 
-    val abstractcs = new Area{
-      val dataCount = factory.read(U(p.datacount, 4 bits), 0x16, 0)
-      val cmdErr = factory.createReadAndClearOnSet(DebugModuleCmdErr(), 0x16, 8) init(DebugModuleCmdErr.NONE)
-      val busy = factory.createReadOnly(Bool(), 0x16, 12) init(False)
-      val progBufSize = factory.read(U(p.progBufSize, 5 bits), 0x16, 24)
-
-      val noError = cmdErr === DebugModuleCmdErr.NONE
-      toHarts.valid clearWhen(busy)
-    }
-
     val abstractAuto = new Area{
-      val autoexecdata = factory.createReadAndWrite(Bits(p.datacount bits), 0x18, 0) init(0)
-      val autoexecProgbuf = factory.createReadAndWrite(Bits(p.progBufSize bits), 0x18, 16) init(0)
+      val autoexecdata = factory.createReadOnly(Bits(p.datacount bits), 0x18, 0) init(0)
+      val autoexecProgbuf = factory.createReadOnly(Bits(p.progBufSize bits), 0x18, 16) init(0)
+
+      factory.onWrite(0x18) {
+        when(!abstractcs.busy) {
+          autoexecdata := io.ctrl.cmd.data(0, p.datacount bits)
+          autoexecProgbuf := io.ctrl.cmd.data(16, p.progBufSize bits)
+        }
+      }
 
       val trigger = progbufX.trigged && autoexecProgbuf(io.ctrl.cmd.address.resized) || dataX.trigged && autoexecdata(dataX.cmdAddress.resized)
     }
@@ -371,7 +402,12 @@ case class DebugModule(p : DebugModuleParameter) extends Component{
       setEntry(IDLE)
       val executionCounter = Reg(UInt(log2Up(p.progBufSize) bits))
       val commandRequest = factory.isWriting(0x17)
-      val data = factory.createWriteOnly(Bits(32 bits), 0x17)
+      val data = Reg(Bits(32 bits))
+      factory.onWrite(0x17) {
+        when(!abstractcs.busy && abstractcs.noError) {
+          data := io.ctrl.cmd.data
+        }
+      }
       val access = new Area{
         case class Args() extends Bundle{
           val regno = UInt(16 bits)
@@ -388,14 +424,8 @@ case class DebugModule(p : DebugModuleParameter) extends Component{
       }
 
       val request = commandRequest || abstractAuto.trigger
-      when(request && abstractcs.busy && abstractcs.noError){
-        abstractcs.cmdErr := DebugModuleCmdErr.BUSY
-      }
       when(io.harts.map(e => e.exception).orR){
-        abstractcs.cmdErr := DebugModuleCmdErr.EXCEPTION
-      }
-      when(abstractcs.busy && (progbufX.trigged || dataX.trigged) && abstractcs.noError){
-        abstractcs.cmdErr := DebugModuleCmdErr.BUSY
+        abstractcs.error := DebugModuleCmdErr.EXCEPTION
       }
 
       IDLE.onEntry(
@@ -404,8 +434,10 @@ case class DebugModule(p : DebugModuleParameter) extends Component{
       IDLE.whenIsActive{
         executionCounter := 0
         when(request && abstractcs.noError) {
-          when(!io.harts.map(_.halted).read(dmcontrol.hartSel.resized)){
-            abstractcs.cmdErr := DebugModuleCmdErr.HALT_RESUME
+          // hartSel.resized aliases a nonexistent hart onto an existing one, while toHarts is only
+          // delivered to the hart matching the full hartSel, so the command would never complete.
+          when(!dmcontrol.hartSelExists || !io.harts.map(_.halted).read(dmcontrol.hartSel.resized)){
+            abstractcs.error := DebugModuleCmdErr.HALT_RESUME
           } otherwise {
             selected.hart := dmcontrol.hartSel.resized
             abstractcs.busy := True
@@ -418,7 +450,7 @@ case class DebugModule(p : DebugModuleParameter) extends Component{
         switch(data(31 downto 24)) {
           is(0) { //access register
             when(access.notSupported) {
-              abstractcs.cmdErr := DebugModuleCmdErr.NOT_SUPPORTED
+              abstractcs.error := DebugModuleCmdErr.NOT_SUPPORTED
             } otherwise {
               when(access.args.postExec){
                 goto(POST_EXEC)
@@ -443,7 +475,7 @@ case class DebugModule(p : DebugModuleParameter) extends Component{
             }
           }
           default{
-            abstractcs.cmdErr := DebugModuleCmdErr.NOT_SUPPORTED
+            abstractcs.error := DebugModuleCmdErr.NOT_SUPPORTED
           }
         }
       }
@@ -501,6 +533,19 @@ case class DebugModule(p : DebugModuleParameter) extends Component{
         when(selected.redo || selected.commit && executionCounter =/= p.progBufSize - 1){
           goto(POST_EXEC)
         }
+      }
+    }
+    // A busy access wins over an error from the command on the same cycle, and
+    // remains sticky while that command runs to completion. cmderr is only valid
+    // to the debugger once busy is low (Debug Specification 1.0, abstractcs).
+    val busyAccess = abstractcs.busy && (
+      factory.isWriting(0x17) || factory.isWriting(0x16) || factory.isWriting(0x18) ||
+      progbufX.trigged || dataX.trigged)
+    when(abstractcs.noError) {
+      when(busyAccess) {
+        abstractcs.cmdErr := DebugModuleCmdErr.BUSY
+      } elsewhen(abstractcs.error =/= DebugModuleCmdErr.NONE) {
+        abstractcs.cmdErr := abstractcs.error
       }
     }
   }
